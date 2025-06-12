@@ -33,6 +33,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
+from custom_dataset import load_custom_image_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
@@ -63,6 +64,68 @@ if is_wandb_available():
 check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
+
+
+class DatasetTransformer:
+    """A picklable class for dataset transformations"""
+    
+    def __init__(self, args, tokenizer, image_column, conditioning_image_column, caption_column):
+        self.args = args
+        self.tokenizer = tokenizer
+        self.image_column = image_column
+        self.conditioning_image_column = conditioning_image_column
+        self.caption_column = caption_column
+        
+        self.image_transforms = transforms.Compose([
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+        
+        self.conditioning_image_transforms = transforms.Compose([
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+        ])
+    
+    def tokenize_captions(self, examples, is_train=True):
+        """Tokenize captions for the dataset"""
+        captions = []
+        if self.args.no_captions:
+            # Use empty strings for all samples
+            captions = [""] * len(examples[self.image_column])
+        else:
+            for caption in examples[self.caption_column]:
+                if random.random() < self.args.proportion_empty_prompts:
+                    captions.append("")
+                elif isinstance(caption, str):
+                    captions.append(caption)
+                elif isinstance(caption, (list, np.ndarray)):
+                    # take a random caption if there are multiple
+                    captions.append(random.choice(caption) if is_train else caption[0])
+                else:
+                    raise ValueError(
+                        f"Caption column `{self.caption_column}` should contain either strings or lists of strings."
+                    )
+        inputs = self.tokenizer(
+            captions, max_length=self.tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids
+    
+    def __call__(self, examples):
+        """Preprocess training examples"""
+        images = [image.convert("RGB") for image in examples[self.image_column]]
+        images = [self.image_transforms(image) for image in images]
+
+        conditioning_images = [image.convert("RGB") for image in examples[self.conditioning_image_column]]
+        conditioning_images = [self.conditioning_image_transforms(image) for image in conditioning_images]
+
+        examples["pixel_values"] = images
+        examples["conditioning_pixel_values"] = conditioning_images
+        examples["input_ids"] = self.tokenize_captions(examples)
+
+        return examples
 
 
 def image_grid(imgs, rows, cols):
@@ -498,6 +561,11 @@ def parse_args(input_args=None):
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
+        "--no_captions",
+        action="store_true",
+        help="Disable caption column requirement and use empty strings as prompts.",
+    )
+    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=None,
@@ -606,17 +674,17 @@ def make_train_dataset(args, tokenizer, accelerator):
     # download the dataset.
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
+        dataset = load_custom_image_dataset(
             args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
+            # args.dataset_config_name,
+            # cache_dir=args.cache_dir,
+            # data_dir=args.train_data_dir,
         )
     else:
         if args.train_data_dir is not None:
-            dataset = load_dataset(
+            dataset = load_custom_image_dataset(
                 args.train_data_dir,
-                cache_dir=args.cache_dir,
+                # cache_dir=args.cache_dir,
             )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
@@ -636,18 +704,23 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    if args.caption_column is None:
-        caption_column = column_names[1]
-        logger.info(f"caption column defaulting to {caption_column}")
+    # Handle caption column only if not disabled
+    if not args.no_captions:
+        if args.caption_column is None:
+            caption_column = column_names[1]
+            logger.info(f"caption column defaulting to {caption_column}")
+        else:
+            caption_column = args.caption_column
+            if caption_column not in column_names:
+                raise ValueError(
+                    f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                )
     else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
+        caption_column = None
+        logger.info("Caption column disabled, using empty strings as prompts")
 
     if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
+        conditioning_image_column = column_names[1] if args.no_captions else column_names[2]
         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
     else:
         conditioning_image_column = args.conditioning_image_column
@@ -656,62 +729,138 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < args.proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
+    # Create the transformer instance
+    transformer = DatasetTransformer(
+        args=args,
+        tokenizer=tokenizer,
+        image_column=image_column,
+        conditioning_image_column=conditioning_image_column,
+        caption_column=caption_column
     )
-
-    conditioning_image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
-
-        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
-        examples["pixel_values"] = images
-        examples["conditioning_pixel_values"] = conditioning_images
-        examples["input_ids"] = tokenize_captions(examples)
-
-        return examples
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        train_dataset = dataset["train"].with_transform(transformer)
 
     return train_dataset
+
+
+# def make_train_dataset(args, tokenizer, accelerator):
+#     # Get the datasets: you can either provide your own training and evaluation files (see below)
+#     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+
+#     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+#     # download the dataset.
+#     if args.dataset_name is not None:
+#         # Downloading and loading a dataset from the hub.
+#         dataset = load_dataset(
+#             args.dataset_name,
+#             args.dataset_config_name,
+#             cache_dir=args.cache_dir,
+#             data_dir=args.train_data_dir,
+#         )
+#     else:
+#         if args.train_data_dir is not None:
+#             dataset = load_dataset(
+#                 args.train_data_dir,
+#                 cache_dir=args.cache_dir,
+#             )
+#         # See more about loading custom images at
+#         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+
+#     # Preprocessing the datasets.
+#     # We need to tokenize inputs and targets.
+#     column_names = dataset["train"].column_names
+
+#     # 6. Get the column names for input/target.
+#     if args.image_column is None:
+#         image_column = column_names[0]
+#         logger.info(f"image column defaulting to {image_column}")
+#     else:
+#         image_column = args.image_column
+#         if image_column not in column_names:
+#             raise ValueError(
+#                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#             )
+
+#     if args.caption_column is None:
+#         caption_column = column_names[1]
+#         logger.info(f"caption column defaulting to {caption_column}")
+#     else:
+#         caption_column = args.caption_column
+#         if caption_column not in column_names:
+#             raise ValueError(
+#                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#             )
+
+#     if args.conditioning_image_column is None:
+#         conditioning_image_column = column_names[2]
+#         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
+#     else:
+#         conditioning_image_column = args.conditioning_image_column
+#         if conditioning_image_column not in column_names:
+#             raise ValueError(
+#                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#             )
+
+#     def tokenize_captions(examples, is_train=True):
+#         captions = []
+#         for caption in examples[caption_column]:
+#             if random.random() < args.proportion_empty_prompts:
+#                 captions.append("")
+#             elif isinstance(caption, str):
+#                 captions.append(caption)
+#             elif isinstance(caption, (list, np.ndarray)):
+#                 # take a random caption if there are multiple
+#                 captions.append(random.choice(caption) if is_train else caption[0])
+#             else:
+#                 raise ValueError(
+#                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
+#                 )
+#         inputs = tokenizer(
+#             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+#         )
+#         return inputs.input_ids
+
+#     image_transforms = transforms.Compose(
+#         [
+#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+#             transforms.CenterCrop(args.resolution),
+#             transforms.ToTensor(),
+#             transforms.Normalize([0.5], [0.5]),
+#         ]
+#     )
+
+#     conditioning_image_transforms = transforms.Compose(
+#         [
+#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+#             transforms.CenterCrop(args.resolution),
+#             transforms.ToTensor(),
+#         ]
+#     )
+
+#     def preprocess_train(examples):
+#         images = [image.convert("RGB") for image in examples[image_column]]
+#         images = [image_transforms(image) for image in images]
+
+#         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
+#         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+
+#         examples["pixel_values"] = images
+#         examples["conditioning_pixel_values"] = conditioning_images
+#         examples["input_ids"] = tokenize_captions(examples)
+
+#         return examples
+
+#     with accelerator.main_process_first():
+#         if args.max_train_samples is not None:
+#             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+#         # Set the training transforms
+#         train_dataset = dataset["train"].with_transform(preprocess_train)
+
+#     return train_dataset
 
 
 def collate_fn(examples):
