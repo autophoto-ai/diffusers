@@ -56,6 +56,13 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+# LoRA imports
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
+
 
 if is_wandb_available():
     import wandb
@@ -628,6 +635,38 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    
+    # LoRA arguments
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Whether to use LoRA for fine-tuning."
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=16,
+        help="The rank of the LoRA layers."
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=32,
+        help="The alpha parameter for LoRA."
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.1,
+        help="The dropout probability for LoRA layers."
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        nargs="+",
+        default=["to_k", "to_q", "to_v", "to_out.0"],
+        help="The target modules to apply LoRA to."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -663,88 +702,11 @@ def parse_args(input_args=None):
             "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the controlnet encoder."
         )
 
+    # LoRA validation
+    if args.use_lora and not HAS_PEFT:
+        raise ValueError("LoRA training requires the `peft` library. Install it with `pip install peft`.")
+
     return args
-
-
-def make_train_dataset(args, tokenizer, accelerator):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_custom_image_dataset(
-            args.dataset_name,
-            # args.dataset_config_name,
-            # cache_dir=args.cache_dir,
-            # data_dir=args.train_data_dir,
-        )
-    else:
-        if args.train_data_dir is not None:
-            dataset = load_custom_image_dataset(
-                args.train_data_dir,
-                # cache_dir=args.cache_dir,
-            )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        logger.info(f"image column defaulting to {image_column}")
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    # Handle caption column only if not disabled
-    if not args.no_captions:
-        if args.caption_column is None:
-            caption_column = column_names[1]
-            logger.info(f"caption column defaulting to {caption_column}")
-        else:
-            caption_column = args.caption_column
-            if caption_column not in column_names:
-                raise ValueError(
-                    f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                )
-    else:
-        caption_column = None
-        logger.info("Caption column disabled, using empty strings as prompts")
-
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[1] if args.no_captions else column_names[2]
-        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    # Create the transformer instance
-    transformer = DatasetTransformer(
-        args=args,
-        tokenizer=tokenizer,
-        image_column=image_column,
-        conditioning_image_column=conditioning_image_column,
-        caption_column=caption_column
-    )
-
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(transformer)
-
-    return train_dataset
 
 
 # def make_train_dataset(args, tokenizer, accelerator):
@@ -755,17 +717,17 @@ def make_train_dataset(args, tokenizer, accelerator):
 #     # download the dataset.
 #     if args.dataset_name is not None:
 #         # Downloading and loading a dataset from the hub.
-#         dataset = load_dataset(
+#         dataset = load_custom_image_dataset(
 #             args.dataset_name,
-#             args.dataset_config_name,
-#             cache_dir=args.cache_dir,
-#             data_dir=args.train_data_dir,
+#             # args.dataset_config_name,
+#             # cache_dir=args.cache_dir,
+#             # data_dir=args.train_data_dir,
 #         )
 #     else:
 #         if args.train_data_dir is not None:
-#             dataset = load_dataset(
+#             dataset = load_custom_image_dataset(
 #                 args.train_data_dir,
-#                 cache_dir=args.cache_dir,
+#                 # cache_dir=args.cache_dir,
 #             )
 #         # See more about loading custom images at
 #         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
@@ -785,18 +747,23 @@ def make_train_dataset(args, tokenizer, accelerator):
 #                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
 #             )
 
-#     if args.caption_column is None:
-#         caption_column = column_names[1]
-#         logger.info(f"caption column defaulting to {caption_column}")
+#     # Handle caption column only if not disabled
+#     if not args.no_captions:
+#         if args.caption_column is None:
+#             caption_column = column_names[1]
+#             logger.info(f"caption column defaulting to {caption_column}")
+#         else:
+#             caption_column = args.caption_column
+#             if caption_column not in column_names:
+#                 raise ValueError(
+#                     f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+#                 )
 #     else:
-#         caption_column = args.caption_column
-#         if caption_column not in column_names:
-#             raise ValueError(
-#                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
+#         caption_column = None
+#         logger.info("Caption column disabled, using empty strings as prompts")
 
 #     if args.conditioning_image_column is None:
-#         conditioning_image_column = column_names[2]
+#         conditioning_image_column = column_names[1] if args.no_captions else column_names[2]
 #         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
 #     else:
 #         conditioning_image_column = args.conditioning_image_column
@@ -805,62 +772,138 @@ def make_train_dataset(args, tokenizer, accelerator):
 #                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
 #             )
 
-#     def tokenize_captions(examples, is_train=True):
-#         captions = []
-#         for caption in examples[caption_column]:
-#             if random.random() < args.proportion_empty_prompts:
-#                 captions.append("")
-#             elif isinstance(caption, str):
-#                 captions.append(caption)
-#             elif isinstance(caption, (list, np.ndarray)):
-#                 # take a random caption if there are multiple
-#                 captions.append(random.choice(caption) if is_train else caption[0])
-#             else:
-#                 raise ValueError(
-#                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
-#                 )
-#         inputs = tokenizer(
-#             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-#         )
-#         return inputs.input_ids
-
-#     image_transforms = transforms.Compose(
-#         [
-#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-#             transforms.CenterCrop(args.resolution),
-#             transforms.ToTensor(),
-#             transforms.Normalize([0.5], [0.5]),
-#         ]
+#     # Create the transformer instance
+#     transformer = DatasetTransformer(
+#         args=args,
+#         tokenizer=tokenizer,
+#         image_column=image_column,
+#         conditioning_image_column=conditioning_image_column,
+#         caption_column=caption_column
 #     )
-
-#     conditioning_image_transforms = transforms.Compose(
-#         [
-#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-#             transforms.CenterCrop(args.resolution),
-#             transforms.ToTensor(),
-#         ]
-#     )
-
-#     def preprocess_train(examples):
-#         images = [image.convert("RGB") for image in examples[image_column]]
-#         images = [image_transforms(image) for image in images]
-
-#         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-#         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
-#         examples["pixel_values"] = images
-#         examples["conditioning_pixel_values"] = conditioning_images
-#         examples["input_ids"] = tokenize_captions(examples)
-
-#         return examples
 
 #     with accelerator.main_process_first():
 #         if args.max_train_samples is not None:
 #             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
 #         # Set the training transforms
-#         train_dataset = dataset["train"].with_transform(preprocess_train)
+#         train_dataset = dataset["train"].with_transform(transformer)
 
 #     return train_dataset
+
+
+def make_train_dataset(args, tokenizer, accelerator):
+    # Get the datasets: you can either provide your own training and evaluation files (see below)
+    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+
+    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+    # download the dataset.
+    if args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            data_dir=args.train_data_dir,
+        )
+    else:
+        if args.train_data_dir is not None:
+            dataset = load_dataset(
+                args.train_data_dir,
+                cache_dir=args.cache_dir,
+            )
+        # See more about loading custom images at
+        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+
+    # Preprocessing the datasets.
+    # We need to tokenize inputs and targets.
+    column_names = dataset["train"].column_names
+
+    # 6. Get the column names for input/target.
+    if args.image_column is None:
+        image_column = column_names[0]
+        logger.info(f"image column defaulting to {image_column}")
+    else:
+        image_column = args.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
+
+    if args.caption_column is None:
+        caption_column = column_names[1]
+        logger.info(f"caption column defaulting to {caption_column}")
+    else:
+        caption_column = args.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
+
+    if args.conditioning_image_column is None:
+        conditioning_image_column = column_names[2]
+        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
+    else:
+        conditioning_image_column = args.conditioning_image_column
+        if conditioning_image_column not in column_names:
+            raise ValueError(
+                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
+
+    def tokenize_captions(examples, is_train=True):
+        captions = []
+        for caption in examples[caption_column]:
+            if random.random() < args.proportion_empty_prompts:
+                captions.append("")
+            elif isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                )
+        inputs = tokenizer(
+            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids
+
+    image_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    conditioning_image_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+        ]
+    )
+
+    def preprocess_train(examples):
+        images = [image.convert("RGB") for image in examples[image_column]]
+        images = [image_transforms(image) for image in images]
+
+        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
+        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+
+        examples["pixel_values"] = images
+        examples["conditioning_pixel_values"] = conditioning_images
+        examples["input_ids"] = tokenize_captions(examples)
+
+        return examples
+
+    with accelerator.main_process_first():
+        if args.max_train_samples is not None:
+            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        # Set the training transforms
+        train_dataset = dataset["train"].with_transform(preprocess_train)
+
+    return train_dataset
 
 
 def collate_fn(examples):
@@ -962,6 +1005,19 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
 
+    # Apply LoRA if requested
+    if args.use_lora:
+        logger.info("Setting up LoRA for ControlNet training")
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.lora_target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+        )
+        controlnet = get_peft_model(controlnet, lora_config)
+        logger.info(f"LoRA applied with rank={args.lora_rank}, alpha={args.lora_alpha}, target_modules={args.lora_target_modules}")
+
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -980,7 +1036,12 @@ def main(args):
                     model = models[i]
 
                     sub_dir = "controlnet"
-                    model.save_pretrained(os.path.join(output_dir, sub_dir))
+                    if args.use_lora:
+                        # For LoRA, save only the adapter weights
+                        model.save_pretrained(os.path.join(output_dir, sub_dir))
+                    else:
+                        # For full fine-tuning, save the entire model
+                        model.save_pretrained(os.path.join(output_dir, sub_dir))
 
                     i -= 1
 
@@ -989,12 +1050,18 @@ def main(args):
                 # pop models so that they are not loaded again
                 model = models.pop()
 
-                # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
-                model.register_to_config(**load_model.config)
-
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                if args.use_lora:
+                    # For LoRA, load the adapter weights
+                    from peft import PeftModel
+                    load_model = PeftModel.from_pretrained(model, input_dir, subfolder="controlnet")
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
+                else:
+                    # For full fine-tuning, load the entire model
+                    load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1305,7 +1372,12 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         controlnet = unwrap_model(controlnet)
-        controlnet.save_pretrained(args.output_dir)
+        if args.use_lora:
+            # Save LoRA weights
+            controlnet.save_pretrained(args.output_dir)
+        else:
+            # Save full model
+            controlnet.save_pretrained(args.output_dir)
 
         # Run a final round of validation.
         image_logs = None
