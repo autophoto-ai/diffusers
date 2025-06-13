@@ -1,17 +1,27 @@
-accelerate==1.7.0
-bitsandbytes==0.46.0
-datasets==3.6.0
-diffusers==0.34.0.dev0
-flax==0.10.6
-huggingface_hub==0.33.0
-jax==0.6.1
-numpy==2.3.0
-optax==0.2.5
-packaging==25.0
-Pillow==11.2.1
-torch==2.7.0
-torchvision==0.22.1
-tqdm==4.67.1
-transformers==4.52.4
-wandb==0.20.1
-xformers==0.0.30
+# Core dependencies first
+numpy
+packaging
+tqdm
+Pillow
+
+# PyTorch ecosystem (must be installed before xformers)
+torch
+torchvision
+
+# JAX ecosystem
+jax
+flax
+optax
+
+# Hugging Face ecosystem
+transformers
+huggingface_hub
+diffusers
+datasets
+accelerate
+
+# Optional/extension packages
+bitsandbytes
+wandb
+
+# (Run separately) xformers last (requires torch to be already installed)
